@@ -13,44 +13,35 @@ RESULTS_DIR = "results"
 
 HEADINGS = ["front", "right", "back", "left"]
 
-# Image ROI used for the 3 front slots
+# ROI for front slots
 ROI_TOP_FRAC = 0.34
 ROI_BOT_FRAC = 0.94
 
 SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.06
 
-# =========================================================
-# HSV THRESHOLDS
-# =========================================================
-
-# White box detection
-WHITE_S_MAX = 80
-WHITE_V_MIN = 150
-
-# Black X detection
-BLACK_V_MAX = 80
-
-# Red X detection
-RED_S_MIN = 90
-RED_V_MIN = 90
-
-# Candidate box filtering
-MIN_WHITE_AREA_FRAC = 0.025
-MAX_WHITE_AREA_FRAC = 0.40
-
-MIN_BOX_W_FRAC = 0.18
-MIN_BOX_H_FRAC = 0.18
-
-# X classification thresholds
-MIN_BLACK_X_FRAC = 0.025
-MIN_RED_X_FRAC = 0.025
-
-# Strong bias toward empty if unsure
-REQUIRE_WHITE_BOX = True
+# Only analyze the front-most part of each slot
+FRONT_ROW_TOP_FRAC = 0.45
 
 # =========================================================
-# OUTPUT
+# HSV THRESHOLDS (tuned for your setup)
+# =========================================================
+
+WHITE_S_MAX = 140
+WHITE_V_MIN = 110
+
+BLACK_V_MAX = 95
+
+RED_S_MIN = 80
+RED_V_MIN = 80
+
+# Detection thresholds
+MIN_WHITE_FRAC = 0.035
+MIN_BLACK_FRAC = 0.020
+MIN_RED_FRAC = 0.020
+
+# =========================================================
+# SETUP
 # =========================================================
 
 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -63,6 +54,10 @@ def clean_mask(mask, ksize=5, iterations=1):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
     return mask
 
+
+# =========================================================
+# SLOT EXTRACTION
+# =========================================================
 
 def get_front_slots(img):
     h, w = img.shape[:2]
@@ -92,150 +87,97 @@ def get_front_slots(img):
     return slots
 
 
-def detect_white_box(slot):
-    hsv = cv2.cvtColor(slot, cv2.COLOR_BGR2HSV)
-    h, w = slot.shape[:2]
-    slot_area = h * w
+# =========================================================
+# CORE DETECTION (FRONT ROW ONLY)
+# =========================================================
 
+def classify_slot_front_row_only(slot):
+    h, w = slot.shape[:2]
+
+    # Only look at front-most area
+    y_start = int(h * FRONT_ROW_TOP_FRAC)
+    crop = slot[y_start:h, :]
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+    # White box
     white_mask = cv2.inRange(
         hsv,
         np.array([0, 0, WHITE_V_MIN]),
         np.array([179, WHITE_S_MAX, 255])
     )
 
-    white_mask = clean_mask(white_mask, ksize=5, iterations=1)
-
-    contours, _ = cv2.findContours(
-        white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    best = None
-    best_area = 0
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        area_frac = area / slot_area
-
-        if area_frac < MIN_WHITE_AREA_FRAC or area_frac > MAX_WHITE_AREA_FRAC:
-            continue
-
-        x, y, bw, bh = cv2.boundingRect(cnt)
-
-        if bw < MIN_BOX_W_FRAC * w or bh < MIN_BOX_H_FRAC * h:
-            continue
-
-        aspect = bw / float(bh)
-        if aspect < 0.45 or aspect > 2.2:
-            continue
-
-        if area > best_area:
-            best_area = area
-            best = (x, y, bw, bh, white_mask)
-
-    return best
-
-
-def classify_x(slot, box):
-    x, y, bw, bh, white_mask = box
-
-    # Focus only inside the detected white box
-    pad_x = int(0.08 * bw)
-    pad_y = int(0.08 * bh)
-
-    x1 = max(0, x + pad_x)
-    y1 = max(0, y + pad_y)
-    x2 = min(slot.shape[1], x + bw - pad_x)
-    y2 = min(slot.shape[0], y + bh - pad_y)
-
-    crop = slot[y1:y2, x1:x2]
-
-    if crop.size == 0:
-        return "E", 0.0, 0.0, None, None
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-    # Black X mask
+    # Black X
     black_mask = cv2.inRange(
         hsv,
         np.array([0, 0, 0]),
         np.array([179, 255, BLACK_V_MAX])
     )
 
-    # Red X mask: red wraps around HSV hue
-    red_mask1 = cv2.inRange(
+    # Red X
+    red1 = cv2.inRange(
         hsv,
         np.array([0, RED_S_MIN, RED_V_MIN]),
         np.array([10, 255, 255])
     )
 
-    red_mask2 = cv2.inRange(
+    red2 = cv2.inRange(
         hsv,
         np.array([170, RED_S_MIN, RED_V_MIN]),
         np.array([179, 255, 255])
     )
 
-    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+    red_mask = cv2.bitwise_or(red1, red2)
 
-    black_mask = clean_mask(black_mask, ksize=3, iterations=1)
-    red_mask = clean_mask(red_mask, ksize=3, iterations=1)
+    # Clean masks
+    white_mask = clean_mask(white_mask, 5, 1)
+    black_mask = clean_mask(black_mask, 3, 1)
+    red_mask = clean_mask(red_mask, 3, 1)
 
-    crop_area = crop.shape[0] * crop.shape[1]
+    area = crop.shape[0] * crop.shape[1]
 
-    black_frac = cv2.countNonZero(black_mask) / crop_area
-    red_frac = cv2.countNonZero(red_mask) / crop_area
+    white_frac = cv2.countNonZero(white_mask) / area
+    black_frac = cv2.countNonZero(black_mask) / area
+    red_frac = cv2.countNonZero(red_mask) / area
 
-    # Classification rule
-    if red_frac >= MIN_RED_X_FRAC and red_frac > black_frac:
-        return "O", black_frac, red_frac, black_mask, red_mask
+    # --- Decision ---
+    if white_frac < MIN_WHITE_FRAC:
+        return "E", white_frac, black_frac, red_frac
 
-    if black_frac >= MIN_BLACK_X_FRAC and black_frac >= red_frac:
-        return "T", black_frac, red_frac, black_mask, red_mask
+    if red_frac >= MIN_RED_FRAC and red_frac > black_frac:
+        return "O", white_frac, black_frac, red_frac
 
-    return "E", black_frac, red_frac, black_mask, red_mask
+    if black_frac >= MIN_BLACK_FRAC:
+        return "T", white_frac, black_frac, red_frac
 
+    return "E", white_frac, black_frac, red_frac
+
+
+# =========================================================
+# PROCESS EACH HEADING
+# =========================================================
 
 def process_heading(heading):
     img_path = os.path.join(SCAN_DIR, f"{heading}.jpg")
 
     if not os.path.exists(img_path):
-        print(f"[WARN] Missing image: {img_path}")
+        print(f"[WARN] Missing {img_path}")
         return ["E", "E", "E"]
 
     img = cv2.imread(img_path)
-
-    if img is None:
-        print(f"[WARN] Could not read image: {img_path}")
-        return ["E", "E", "E"]
-
     debug = img.copy()
-    slots = get_front_slots(img)
 
+    slots = get_front_slots(img)
     result = []
 
-    for idx, (x1, y1, x2, y2) in enumerate(slots):
+    for (x1, y1, x2, y2) in slots:
         slot = img[y1:y2, x1:x2]
 
-        box = detect_white_box(slot)
-
-        if box is None:
-            label = "E"
-            black_frac = 0.0
-            red_frac = 0.0
-        else:
-            label, black_frac, red_frac, black_mask, red_mask = classify_x(slot, box)
-
-            bx, by, bw, bh, _ = box
-            cv2.rectangle(
-                debug,
-                (x1 + bx, y1 + by),
-                (x1 + bx + bw, y1 + by + bh),
-                (255, 255, 255),
-                2
-            )
+        label, white_frac, black_frac, red_frac = classify_slot_front_row_only(slot)
 
         result.append(label)
 
-        # Draw slot
+        # Color for debug
         color = (0, 255, 0)
         if label == "T":
             color = (0, 0, 0)
@@ -246,7 +188,7 @@ def process_heading(heading):
 
         cv2.putText(
             debug,
-            f"{label} B:{black_frac:.3f} R:{red_frac:.3f}",
+            f"{label} W:{white_frac:.2f} B:{black_frac:.2f} R:{red_frac:.2f}",
             (x1 + 10, y1 + 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -261,54 +203,11 @@ def process_heading(heading):
     return result
 
 
-def build_object_3x3(front, right, back, left):
-    """
-    Local 3x3 object grid.
-
-    Center is agent A.
-
-    This keeps the same scan logic:
-    front heading fills top row.
-    right heading fills right column.
-    back heading fills bottom row.
-    left heading fills left column.
-    """
-
-    grid = [
-        ["E", "E", "E"],
-        ["E", "A", "E"],
-        ["E", "E", "E"]
-    ]
-
-    # front image: left, center, right
-    grid[0][0] = front[0]
-    grid[0][1] = front[1]
-    grid[0][2] = front[2]
-
-    # right image
-    grid[0][2] = strongest(grid[0][2], right[0])
-    grid[1][2] = right[1]
-    grid[2][2] = right[2]
-
-    # back image
-    grid[2][2] = strongest(grid[2][2], back[0])
-    grid[2][1] = back[1]
-    grid[2][0] = back[2]
-
-    # left image
-    grid[2][0] = strongest(grid[2][0], left[0])
-    grid[1][0] = left[1]
-    grid[0][0] = strongest(grid[0][0], left[2])
-
-    return grid
-
+# =========================================================
+# BUILD 3x3 GRID
+# =========================================================
 
 def strongest(a, b):
-    """
-    Resolve duplicated corner observations.
-    Object wins over empty.
-    Obstacle wins over target if conflict, because obstacle is safety-critical.
-    """
     if a == "O" or b == "O":
         return "O"
     if a == "T" or b == "T":
@@ -316,45 +215,70 @@ def strongest(a, b):
     return "E"
 
 
+def build_object_3x3(front, right, back, left):
+    grid = [
+        ["E", "E", "E"],
+        ["E", "A", "E"],
+        ["E", "E", "E"]
+    ]
+
+    grid[0] = front
+
+    grid[0][2] = strongest(grid[0][2], right[0])
+    grid[1][2] = right[1]
+    grid[2][2] = right[2]
+
+    grid[2][2] = strongest(grid[2][2], back[0])
+    grid[2][1] = back[1]
+    grid[2][0] = back[2]
+
+    grid[2][0] = strongest(grid[2][0], left[0])
+    grid[1][0] = left[1]
+    grid[0][0] = strongest(grid[0][0], left[2])
+
+    return grid
+
+
+# =========================================================
+# SAVE
+# =========================================================
+
 def save_grid(grid):
     txt_path = os.path.join(RESULTS_DIR, "object_3x3.txt")
-    json_path = os.path.join(RESULTS_DIR, "object_3x3.json")
 
     with open(txt_path, "w") as f:
         for row in grid:
             f.write(" ".join(row) + "\n")
 
-    with open(json_path, "w") as f:
-        json.dump({"object_grid": grid}, f, indent=2)
-
     print(f"[OK] Saved: {txt_path}")
-    print(f"[OK] Saved: {json_path}")
 
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    print("[INFO] Starting object detection...")
+    print("[INFO] Object detection (front-row mode)")
 
-    heading_results = {}
+    results = {}
 
     for heading in HEADINGS:
-        row = process_heading(heading)
-        heading_results[heading] = row
-        print(f"{heading}: {row}")
+        res = process_heading(heading)
+        results[heading] = res
+        print(f"{heading}: {res}")
 
-    object_grid = build_object_3x3(
-        heading_results["front"],
-        heading_results["right"],
-        heading_results["back"],
-        heading_results["left"]
+    grid = build_object_3x3(
+        results["front"],
+        results["right"],
+        results["back"],
+        results["left"]
     )
 
-    print("\nFinal object 3x3:")
-    for row in object_grid:
+    print("\nFinal object grid:")
+    for row in grid:
         print(row)
 
-    save_grid(object_grid)
-
-    print(f"[OK] Debug images saved in: {DEBUG_DIR}")
+    save_grid(grid)
 
 
 if __name__ == "__main__":
