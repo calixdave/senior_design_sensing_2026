@@ -33,9 +33,9 @@ SLOT_PAD_Y_FRAC = 0.06
 # =========================================================
 # STRICT WHITE BOX DETECTION
 # =========================================================
-WHITE_THRESH = 190
-MIN_WHITE_AREA = 1500
-MIN_WHITE_FILL = 0.60
+WHITE_THRESH = 135
+MIN_WHITE_AREA = 900
+MIN_WHITE_FILL = 0.35
 
 MIN_BOX_W = 30
 MIN_BOX_H = 30
@@ -45,17 +45,17 @@ MAX_ASPECT = 1.35
 # =========================================================
 # TARGET = WHITE BOX + BLACK X
 # =========================================================
-BLACK_THRESH = 70
-MIN_BLACK_DIAG_SCORE = 0.18
-MIN_BLACK_COMBINED = 0.42
+BLACK_THRESH = 90
+MIN_BLACK_DIAG_SCORE = 0.12
+MIN_BLACK_COMBINED = 0.28
 
 # =========================================================
 # OBSTACLE = WHITE BOX + RED X
 # =========================================================
-RED_MIN_R = 150
-RED_MARGIN = 60
-MIN_RED_DIAG_SCORE = 0.16
-MIN_RED_COMBINED = 0.38
+RED_MIN_R = 110
+RED_MARGIN = 35
+MIN_RED_DIAG_SCORE = 0.10
+MIN_RED_COMBINED = 0.24
 
 # =========================================================
 # EXTRA RELIABILITY SETTINGS
@@ -164,17 +164,24 @@ def inner_crop(arr):
     return arr[y0:y1, x0:x1]
 
 
+WHITE_THRESH = 135      # instead of 190
+MIN_WHITE_AREA = 900    # instead of 1500
+MIN_WHITE_FILL = 0.35   # instead of 0.60
+
+Also make the white detection use HSV instead of grayscale only. Replace get_strict_white_candidates() with this version:
+
 def get_strict_white_candidates(slot_bgr):
     """
-    This stage ignores tile color and only searches for a strong white square.
-    If no white square exists, the slot is EMPTY.
+    Detect white box using HSV + brightness.
+    More reliable than gray threshold only under Pi camera lighting.
     """
-    gray = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
 
-    white_mask = cv2.threshold(gray, WHITE_THRESH, 255, cv2.THRESH_BINARY)[1]
+    # white = bright enough and low saturation
+    white_mask = ((v >= WHITE_THRESH) & (s <= 90)).astype(np.uint8) * 255
 
-    kernel = np.ones((3, 3), np.uint8)
+    kernel = np.ones((5, 5), np.uint8)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
 
