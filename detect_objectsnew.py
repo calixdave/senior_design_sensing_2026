@@ -6,20 +6,22 @@ import numpy as np
 # =========================================================
 # detect_objects.py
 #
-# Object rule:
-#   1. Look ONLY at the front-row ROI.
-#   2. Split the front row into 3 tile slots: left, center, right.
-#   3. In each slot, find the LARGEST WHITE BLOB.
-#   4. Dilate that white blob to create the object zone.
-#   5. Only classify red/black pixels INSIDE that dilated blob.
+# Detects objects only in the FRONT ROW of each scan image.
 #
 # Target   = white box + black X
 # Obstacle = white box + red X
-# Empty    = no valid white blob / no strong X color
-# =========================================================
-
-# =========================================================
-# FOLDERS
+# Empty    = no valid white box
+#
+# Main method:
+#   1. Split front-row ROI into 3 slots.
+#   2. Find white mask.
+#   3. Keep largest white blob.
+#   4. Validate blob:
+#        - large enough
+#        - dominant enough
+#        - not touching slot border
+#   5. Dilate blob to object zone.
+#   6. Count red/black pixels only inside that zone.
 # =========================================================
 
 SCAN_DIR = "scan_images"
@@ -33,7 +35,6 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # =========================================================
 # FRONT-ROW ROI SETTINGS
-# Lowered/focused toward the row directly in front of robot
 # =========================================================
 
 ROI_TOP_FRAC = 0.52
@@ -43,68 +44,58 @@ SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.05
 
 # =========================================================
-# COLOR THRESHOLDS
+# WHITE BOX SETTINGS
 # =========================================================
 
-# White object box
 WHITE_S_MAX = 90
 WHITE_V_MIN = 145
 
-# Required white fraction inside a slot
 MIN_WHITE_FRAC = 0.08
 
-# Red X
+# Real object box should create one strong blob
+MIN_BLOB_FRAC = 0.12
+MAX_BLOB_FRAC = 0.70
+
+# Largest blob must contain most of the white pixels
+MIN_BLOB_DOMINANCE = 0.60
+
+# Reject blob if it touches the slot border
+REJECT_BORDER_TOUCHING_BLOB = True
+
+# =========================================================
+# RED / BLACK X SETTINGS
+# =========================================================
+
 RED_S_MIN = 140
 RED_V_MIN = 80
 
-# Black X
 BLACK_V_MAX = 85
-BLACK_S_MAX = 160
+BLACK_S_MAX = 180
+
+MIN_RED_FRAC_IN_ZONE = 0.030
+MIN_BLACK_FRAC_IN_ZONE = 0.035
+
+RED_DOMINANCE_RATIO = 1.20
+BLACK_DOMINANCE_RATIO = 1.10
 
 # =========================================================
-# LARGEST WHITE BLOB FILTERS
+# DILATED OBJECT ZONE SETTINGS
 # =========================================================
-
-MIN_BLOB_AREA_FRAC = 0.015
-MAX_BLOB_AREA_FRAC = 0.70
 
 DILATE_KERNEL_SIZE = 13
 DILATE_ITERATIONS = 2
 
 # =========================================================
-# X COLOR DECISION THRESHOLDS
-# =========================================================
-
-MIN_RED_FRAC_IN_ZONE = 0.030
-MIN_BLACK_FRAC_IN_ZONE = 0.035
-
-# Red must beat black to be obstacle
-RED_DOMINANCE_RATIO = 1.20
-
-# Black must beat red to be target
-BLACK_DOMINANCE_RATIO = 1.10
-
-# =========================================================
 # DRAW COLORS
 # =========================================================
 
-COLOR_EMPTY = (180, 180, 180)
-COLOR_TARGET = (0, 255, 0)
+COLOR_EMPTY = (0, 255, 0)
+COLOR_TARGET = (0, 0, 0)
 COLOR_OBSTACLE = (0, 0, 255)
-COLOR_SLOT = (255, 255, 0)
-COLOR_WHITE_BLOB = (255, 0, 255)
+COLOR_SLOT = (0, 255, 0)
 
-
-# =========================================================
-# HELPERS
-# =========================================================
 
 def front_row_slots(img):
-    """
-    Return 3 front-row slot rectangles:
-    left, center, right.
-    Each rectangle is (x1, y1, x2, y2).
-    """
     h, w = img.shape[:2]
 
     roi_y1 = int(h * ROI_TOP_FRAC)
@@ -147,11 +138,9 @@ def make_white_mask(bgr):
 
 
 def largest_white_blob_mask(white_mask):
-    """
-    Keep only the largest connected white blob.
-    """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        white_mask, connectivity=8
+        white_mask,
+        connectivity=8
     )
 
     if num_labels <= 1:
@@ -162,6 +151,7 @@ def largest_white_blob_mask(white_mask):
 
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
+
         if area > largest_area:
             largest_area = area
             largest_label = label
@@ -175,6 +165,18 @@ def largest_white_blob_mask(white_mask):
     return blob, largest_area
 
 
+def blob_touches_border(blob_mask):
+    if blob_mask is None:
+        return False
+
+    top = np.any(blob_mask[0, :] > 0)
+    bottom = np.any(blob_mask[-1, :] > 0)
+    left = np.any(blob_mask[:, 0] > 0)
+    right = np.any(blob_mask[:, -1] > 0)
+
+    return top or bottom or left or right
+
+
 def dilate_blob(blob_mask):
     kernel = np.ones((DILATE_KERNEL_SIZE, DILATE_KERNEL_SIZE), np.uint8)
     return cv2.dilate(blob_mask, kernel, iterations=DILATE_ITERATIONS)
@@ -184,9 +186,8 @@ def make_red_black_masks(bgr):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # Red wraps around hue 0
-    red1 = (h <= 10)
-    red2 = (h >= 170)
+    red1 = h <= 10
+    red2 = h >= 170
 
     red = ((red1 | red2) & (s >= RED_S_MIN) & (v >= RED_V_MIN)).astype(np.uint8) * 255
 
@@ -204,25 +205,20 @@ def make_red_black_masks(bgr):
 
 
 def classify_slot(slot_bgr):
-    """
-    Return:
-        label: "E", "T", or "O"
-        debug_info: dictionary
-        debug_masks: dictionary
-    """
-
     slot_h, slot_w = slot_bgr.shape[:2]
     slot_area = slot_h * slot_w
 
     white_mask = make_white_mask(slot_bgr)
-
-    white_frac_total = cv2.countNonZero(white_mask) / float(slot_area)
+    total_white_pixels = cv2.countNonZero(white_mask)
+    white_frac_total = total_white_pixels / float(slot_area)
 
     blob_mask, blob_area = largest_white_blob_mask(white_mask)
 
-    debug_info = {
+    info = {
         "white_frac_total": float(white_frac_total),
         "largest_blob_frac": 0.0,
+        "blob_dominance": 0.0,
+        "blob_touches_border": False,
         "red_frac_in_zone": 0.0,
         "black_frac_in_zone": 0.0,
         "red_pixels": 0,
@@ -231,7 +227,7 @@ def classify_slot(slot_bgr):
         "label": "E"
     }
 
-    debug_masks = {
+    masks = {
         "white_mask": white_mask,
         "blob_mask": np.zeros_like(white_mask),
         "zone_mask": np.zeros_like(white_mask),
@@ -239,27 +235,50 @@ def classify_slot(slot_bgr):
         "black_in_zone": np.zeros_like(white_mask)
     }
 
-    if blob_mask is None:
-        return "E", debug_info, debug_masks
+    if blob_mask is None or total_white_pixels <= 0:
+        return "E", info, masks
 
     blob_frac = blob_area / float(slot_area)
-    debug_info["largest_blob_frac"] = float(blob_frac)
-    debug_masks["blob_mask"] = blob_mask
+    blob_dominance = blob_area / float(total_white_pixels)
+    touches_border = blob_touches_border(blob_mask)
+
+    info["largest_blob_frac"] = float(blob_frac)
+    info["blob_dominance"] = float(blob_dominance)
+    info["blob_touches_border"] = bool(touches_border)
+
+    masks["blob_mask"] = blob_mask
+
+    # -----------------------------------------------------
+    # Strict white-box validation
+    # -----------------------------------------------------
 
     if white_frac_total < MIN_WHITE_FRAC:
-        return "E", debug_info, debug_masks
+        return "E", info, masks
 
-    if blob_frac < MIN_BLOB_AREA_FRAC or blob_frac > MAX_BLOB_AREA_FRAC:
-        return "E", debug_info, debug_masks
+    if blob_frac < MIN_BLOB_FRAC:
+        return "E", info, masks
+
+    if blob_frac > MAX_BLOB_FRAC:
+        return "E", info, masks
+
+    if blob_dominance < MIN_BLOB_DOMINANCE:
+        return "E", info, masks
+
+    if REJECT_BORDER_TOUCHING_BLOB and touches_border:
+        return "E", info, masks
+
+    # -----------------------------------------------------
+    # Only now create object zone and inspect X color
+    # -----------------------------------------------------
 
     zone_mask = dilate_blob(blob_mask)
-    debug_masks["zone_mask"] = zone_mask
+    masks["zone_mask"] = zone_mask
 
     zone_pixels = cv2.countNonZero(zone_mask)
-    debug_info["zone_pixels"] = int(zone_pixels)
+    info["zone_pixels"] = int(zone_pixels)
 
     if zone_pixels <= 0:
-        return "E", debug_info, debug_masks
+        return "E", info, masks
 
     red_mask, black_mask = make_red_black_masks(slot_bgr)
 
@@ -272,13 +291,13 @@ def classify_slot(slot_bgr):
     red_frac = red_pixels / float(zone_pixels)
     black_frac = black_pixels / float(zone_pixels)
 
-    debug_info["red_pixels"] = int(red_pixels)
-    debug_info["black_pixels"] = int(black_pixels)
-    debug_info["red_frac_in_zone"] = float(red_frac)
-    debug_info["black_frac_in_zone"] = float(black_frac)
+    info["red_pixels"] = int(red_pixels)
+    info["black_pixels"] = int(black_pixels)
+    info["red_frac_in_zone"] = float(red_frac)
+    info["black_frac_in_zone"] = float(black_frac)
 
-    debug_masks["red_in_zone"] = red_in_zone
-    debug_masks["black_in_zone"] = black_in_zone
+    masks["red_in_zone"] = red_in_zone
+    masks["black_in_zone"] = black_in_zone
 
     label = "E"
 
@@ -288,9 +307,9 @@ def classify_slot(slot_bgr):
     elif black_frac >= MIN_BLACK_FRAC_IN_ZONE and black_frac > red_frac * BLACK_DOMINANCE_RATIO:
         label = "T"
 
-    debug_info["label"] = label
+    info["label"] = label
 
-    return label, debug_info, debug_masks
+    return label, info, masks
 
 
 def make_debug_canvas(img, slots, labels, infos):
@@ -298,18 +317,20 @@ def make_debug_canvas(img, slots, labels, infos):
 
     for i, (x1, y1, x2, y2) in enumerate(slots):
         label = labels[i]
+        info = infos[i]
 
-        if label == "T":
-            color = COLOR_TARGET
-            text = "T target"
-        elif label == "O":
+        if label == "O":
             color = COLOR_OBSTACLE
             text = "O obstacle"
+        elif label == "T":
+            color = COLOR_TARGET
+            text = "T target"
         else:
             color = COLOR_EMPTY
             text = "E empty"
 
-        cv2.rectangle(debug, (x1, y1), (x2, y2), COLOR_SLOT, 2)
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
+
         cv2.putText(
             debug,
             text,
@@ -321,17 +342,24 @@ def make_debug_canvas(img, slots, labels, infos):
             cv2.LINE_AA
         )
 
-        info = infos[i]
+        line1 = (
+            f"W={info['white_frac_total']:.2f} "
+            f"B={info['largest_blob_frac']:.2f} "
+            f"D={info['blob_dominance']:.2f}"
+        )
 
-        line1 = f"W={info['white_frac_total']:.2f} BLOB={info['largest_blob_frac']:.2f}"
-        line2 = f"R={info['red_frac_in_zone']:.3f} K={info['black_frac_in_zone']:.3f}"
+        line2 = (
+            f"R={info['red_frac_in_zone']:.3f} "
+            f"K={info['black_frac_in_zone']:.3f} "
+            f"BT={int(info['blob_touches_border'])}"
+        )
 
         cv2.putText(
             debug,
             line1,
-            (x1 + 8, y1 + 58),
+            (x1 + 8, y1 + 56),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.45,
             color,
             1,
             cv2.LINE_AA
@@ -340,9 +368,9 @@ def make_debug_canvas(img, slots, labels, infos):
         cv2.putText(
             debug,
             line2,
-            (x1 + 8, y1 + 82),
+            (x1 + 8, y1 + 78),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.45,
             color,
             1,
             cv2.LINE_AA
@@ -355,17 +383,15 @@ def save_mask(path, mask):
     cv2.imwrite(path, mask)
 
 
-# =========================================================
-# MAIN PROCESS
-# =========================================================
-
 def process_heading(heading):
-    img_path = os.path.join(SCAN_DIR, f"{heading}.jpg")
+    jpg_path = os.path.join(SCAN_DIR, f"{heading}.jpg")
+    png_path = os.path.join(SCAN_DIR, f"{heading}.png")
 
-    if not os.path.exists(img_path):
-        img_path = os.path.join(SCAN_DIR, f"{heading}.png")
-
-    if not os.path.exists(img_path):
+    if os.path.exists(jpg_path):
+        img_path = jpg_path
+    elif os.path.exists(png_path):
+        img_path = png_path
+    else:
         print(f"[WARN] Missing image for {heading}")
         return ["E", "E", "E"], []
 
@@ -414,17 +440,14 @@ def main():
 
         print(f"{heading}: {labels}")
 
-    # Save JSON result
     json_path = os.path.join(RESULTS_DIR, "object_results.json")
     with open(json_path, "w") as f:
         json.dump(all_results, f, indent=4)
 
-    # Save debug JSON
     debug_json_path = os.path.join(RESULTS_DIR, "object_debug_values.json")
     with open(debug_json_path, "w") as f:
         json.dump(all_debug, f, indent=4)
 
-    # Save simple text format
     txt_path = os.path.join(RESULTS_DIR, "object_results.txt")
     with open(txt_path, "w") as f:
         for heading in HEADINGS:
