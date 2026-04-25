@@ -1,504 +1,360 @@
 import os
 import cv2
+import json
 import numpy as np
 
 # =========================================================
-# INPUT / OUTPUT
+# CONFIG
 # =========================================================
-SCAN_DIR = "scan_images"
-RESULTS_DIR = "results"
-DEBUG_DIR = "debug_objects"
 
-os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(DEBUG_DIR, exist_ok=True)
+SCAN_DIR = "scan_images"
+DEBUG_DIR = "debug_objects"
+RESULTS_DIR = "results"
 
 HEADINGS = ["front", "right", "back", "left"]
 
-IMAGE_PATHS = {
-    "front": os.path.join(SCAN_DIR, "front.jpg"),
-    "right": os.path.join(SCAN_DIR, "right.jpg"),
-    "back":  os.path.join(SCAN_DIR, "back.jpg"),
-    "left":  os.path.join(SCAN_DIR, "left.jpg"),
-}
+# Image ROI used for the 3 front slots
+ROI_TOP_FRAC = 0.34
+ROI_BOT_FRAC = 0.94
 
-# =========================================================
-# ROI / SLOT SETTINGS
-# =========================================================
-ROI_TOP_FRAC = 0.62
-ROI_BOT_FRAC = 0.93
-
-SLOT_PAD_X_FRAC = 0.02
+SLOT_PAD_X_FRAC = 0.03
 SLOT_PAD_Y_FRAC = 0.06
 
 # =========================================================
-# STRICT WHITE BOX DETECTION
+# HSV THRESHOLDS
 # =========================================================
-WHITE_THRESH = 135
-MIN_WHITE_AREA = 900
-MIN_WHITE_FILL = 0.35
 
-MIN_BOX_W = 30
-MIN_BOX_H = 30
-MIN_ASPECT = 0.65
-MAX_ASPECT = 1.35
+# White box detection
+WHITE_S_MAX = 80
+WHITE_V_MIN = 150
+
+# Black X detection
+BLACK_V_MAX = 80
+
+# Red X detection
+RED_S_MIN = 90
+RED_V_MIN = 90
+
+# Candidate box filtering
+MIN_WHITE_AREA_FRAC = 0.025
+MAX_WHITE_AREA_FRAC = 0.40
+
+MIN_BOX_W_FRAC = 0.18
+MIN_BOX_H_FRAC = 0.18
+
+# X classification thresholds
+MIN_BLACK_X_FRAC = 0.025
+MIN_RED_X_FRAC = 0.025
+
+# Strong bias toward empty if unsure
+REQUIRE_WHITE_BOX = True
 
 # =========================================================
-# TARGET = WHITE BOX + BLACK X
+# OUTPUT
 # =========================================================
-BLACK_THRESH = 90
-MIN_BLACK_DIAG_SCORE = 0.12
-MIN_BLACK_COMBINED = 0.28
 
-# =========================================================
-# OBSTACLE = WHITE BOX + RED X
-# =========================================================
-RED_MIN_R = 110
-RED_MARGIN = 35
-MIN_RED_DIAG_SCORE = 0.10
-MIN_RED_COMBINED = 0.24
-
-# =========================================================
-# EXTRA RELIABILITY SETTINGS
-# =========================================================
-INNER_CROP_FRAC = 0.12
-DIAG_BAND_FRAC = 0.08
-
-EMPTY = "EMPTY"
-TARGET = "TARGET"
-OBSTACLE = "OBSTACLE"
-AGENT = "AGENT"
-
-# Local 3x3 object placement around agent
-HEADING_TO_POSITIONS = {
-    "front": [(-1, +1), (0, +1), (+1, +1)],
-    "right": [(+1, +1), (+1, 0), (+1, -1)],
-    "back":  [(+1, -1), (0, -1), (-1, -1)],
-    "left":  [(-1, -1), (-1, 0), (-1, +1)],
-}
+os.makedirs(DEBUG_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
-def state_to_char(state):
-    if state == TARGET:
-        return "T"
-    if state == OBSTACLE:
-        return "X"
-    if state == AGENT:
-        return "A"
-    return "E"
+def clean_mask(mask, ksize=5, iterations=1):
+    kernel = np.ones((ksize, ksize), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=iterations)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+    return mask
 
 
-def blank_local_grid():
-    grid = {}
-    for dy in [-1, 0, 1]:
-        for dx in [-1, 0, 1]:
-            grid[(dx, dy)] = EMPTY
-    grid[(0, 0)] = AGENT
-    return grid
+def get_front_slots(img):
+    h, w = img.shape[:2]
 
+    y1 = int(h * ROI_TOP_FRAC)
+    y2 = int(h * ROI_BOT_FRAC)
 
-def pretty_matrix(grid):
-    rows = []
-    for dy in [1, 0, -1]:
-        row = []
-        for dx in [-1, 0, 1]:
-            row.append(state_to_char(grid[(dx, dy)]))
-        rows.append(row)
-    return rows
-
-
-def print_matrix(grid):
-    print("\nFinal 3x3 object matrix:")
-    for row in pretty_matrix(grid):
-        print(" ".join(row))
-
-
-def make_slot_boxes(w, h):
-    y0 = int(h * ROI_TOP_FRAC)
-    y1 = int(h * ROI_BOT_FRAC)
-
-    roi_h = y1 - y0
+    roi_h = y2 - y1
     slot_w = w // 3
 
-    boxes = []
+    slots = []
+
     for i in range(3):
-        x0 = i * slot_w
-        x1 = (i + 1) * slot_w
+        x1 = i * slot_w
+        x2 = (i + 1) * slot_w if i < 2 else w
 
-        pad_x = int(slot_w * SLOT_PAD_X_FRAC)
-        pad_y = int(roi_h * SLOT_PAD_Y_FRAC)
+        px = int((x2 - x1) * SLOT_PAD_X_FRAC)
+        py = int(roi_h * SLOT_PAD_Y_FRAC)
 
-        sx0 = max(0, x0 + pad_x)
-        sx1 = min(w, x1 - pad_x)
-        sy0 = max(0, y0 + pad_y)
-        sy1 = min(h, y1 - pad_y)
+        sx1 = max(0, x1 + px)
+        sx2 = min(w, x2 - px)
+        sy1 = max(0, y1 + py)
+        sy2 = min(h, y2 - py)
 
-        boxes.append((sx0, sy0, sx1, sy1))
+        slots.append((sx1, sy1, sx2, sy2))
 
-    return boxes
-
-
-def diagonal_band_masks(h, w):
-    yy, xx = np.indices((h, w))
-    band = max(2, int(min(h, w) * DIAG_BAND_FRAC))
-
-    d1 = np.abs(yy - ((h - 1) / max(1, w - 1)) * xx) <= band
-    d2 = np.abs(yy - ((h - 1) - ((h - 1) / max(1, w - 1)) * xx)) <= band
-
-    return d1, d2
+    return slots
 
 
-def inner_crop(arr):
-    h, w = arr.shape[:2]
+def detect_white_box(slot):
+    hsv = cv2.cvtColor(slot, cv2.COLOR_BGR2HSV)
+    h, w = slot.shape[:2]
+    slot_area = h * w
 
-    mx = int(w * INNER_CROP_FRAC)
-    my = int(h * INNER_CROP_FRAC)
-
-    x0 = mx
-    x1 = w - mx
-    y0 = my
-    y1 = h - my
-
-    if x1 <= x0 or y1 <= y0:
-        return arr
-
-    return arr[y0:y1, x0:x1]
-
-
-WHITE_THRESH = 135      # instead of 190
-MIN_WHITE_AREA = 900    # instead of 1500
-MIN_WHITE_FILL = 0.35   # instead of 0.60
-
-Also make the white detection use HSV instead of grayscale only. Replace get_strict_white_candidates() with this version:
-
-def get_strict_white_candidates(slot_bgr):
-    """
-    Detect white box using HSV + brightness.
-    More reliable than gray threshold only under Pi camera lighting.
-    """
-    hsv = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    # white = bright enough and low saturation
-    white_mask = ((v >= WHITE_THRESH) & (s <= 90)).astype(np.uint8) * 255
-
-    kernel = np.ones((5, 5), np.uint8)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(
-        white_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+    white_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, WHITE_V_MIN]),
+        np.array([179, WHITE_S_MAX, 255])
     )
 
-    candidates = []
+    white_mask = clean_mask(white_mask, ksize=5, iterations=1)
+
+    contours, _ = cv2.findContours(
+        white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best = None
+    best_area = 0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < MIN_WHITE_AREA:
+        area_frac = area / slot_area
+
+        if area_frac < MIN_WHITE_AREA_FRAC or area_frac > MAX_WHITE_AREA_FRAC:
             continue
 
-        x, y, w, h = cv2.boundingRect(cnt)
+        x, y, bw, bh = cv2.boundingRect(cnt)
 
-        if w < MIN_BOX_W or h < MIN_BOX_H:
+        if bw < MIN_BOX_W_FRAC * w or bh < MIN_BOX_H_FRAC * h:
             continue
 
-        aspect = w / float(h)
-        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+        aspect = bw / float(bh)
+        if aspect < 0.45 or aspect > 2.2:
             continue
 
-        roi_white = white_mask[y:y+h, x:x+w]
-        if roi_white.size == 0:
-            continue
+        if area > best_area:
+            best_area = area
+            best = (x, y, bw, bh, white_mask)
 
-        white_fill = np.mean(roi_white > 0)
-
-        if white_fill < MIN_WHITE_FILL:
-            continue
-
-        candidates.append((x, y, w, h, white_fill))
-
-    return candidates, white_mask
+    return best
 
 
-def black_x_scores(inner_bgr):
-    gray = cv2.cvtColor(inner_bgr, cv2.COLOR_BGR2GRAY)
-    black_mask = gray < BLACK_THRESH
+def classify_x(slot, box):
+    x, y, bw, bh, white_mask = box
 
-    h, w = gray.shape
-    if h < 20 or w < 20:
-        return 0.0, 0.0, black_mask
+    # Focus only inside the detected white box
+    pad_x = int(0.08 * bw)
+    pad_y = int(0.08 * bh)
 
-    d1, d2 = diagonal_band_masks(h, w)
+    x1 = max(0, x + pad_x)
+    y1 = max(0, y + pad_y)
+    x2 = min(slot.shape[1], x + bw - pad_x)
+    y2 = min(slot.shape[0], y + bh - pad_y)
 
-    s1 = float(black_mask[d1].mean()) if np.any(d1) else 0.0
-    s2 = float(black_mask[d2].mean()) if np.any(d2) else 0.0
+    crop = slot[y1:y2, x1:x2]
 
-    return s1, s2, black_mask
+    if crop.size == 0:
+        return "E", 0.0, 0.0, None, None
 
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-def red_x_scores(inner_bgr):
-    b = inner_bgr[:, :, 0].astype(np.int16)
-    g = inner_bgr[:, :, 1].astype(np.int16)
-    r = inner_bgr[:, :, 2].astype(np.int16)
-
-    red_mask = (
-        (r >= RED_MIN_R) &
-        ((r - g) >= RED_MARGIN) &
-        ((r - b) >= RED_MARGIN)
+    # Black X mask
+    black_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, 0]),
+        np.array([179, 255, BLACK_V_MAX])
     )
 
-    h, w = red_mask.shape
-    if h < 20 or w < 20:
-        return 0.0, 0.0, red_mask
-
-    d1, d2 = diagonal_band_masks(h, w)
-
-    s1 = float(red_mask[d1].mean()) if np.any(d1) else 0.0
-    s2 = float(red_mask[d2].mean()) if np.any(d2) else 0.0
-
-    return s1, s2, red_mask
-
-
-def classify_marker_in_slot(slot_bgr):
-    """
-    Strict logic:
-    1. Find real white square.
-    2. Crop inside that square.
-    3. Check if black X or red X exists.
-    4. If uncertain, return EMPTY.
-    """
-    candidates, white_mask = get_strict_white_candidates(slot_bgr)
-
-    best_state = EMPTY
-    best_rect = None
-    best_info = {
-        "reason": "no_strong_white_box",
-        "black_combined": 0.0,
-        "red_combined": 0.0,
-        "white_fill": 0.0,
-    }
-
-    best_score = -1.0
-
-    for x, y, w, h, white_fill in candidates:
-        box_roi = slot_bgr[y:y+h, x:x+w]
-        if box_roi.size == 0:
-            continue
-
-        inner = inner_crop(box_roi)
-        if inner.size == 0:
-            continue
-
-        b1, b2, _ = black_x_scores(inner)
-        r1, r2, _ = red_x_scores(inner)
-
-        black_combined = b1 + b2
-        red_combined = r1 + r2
-
-        # -------------------------------
-        # Hard reject weak detections
-        # -------------------------------
-        if black_combined < MIN_BLACK_COMBINED and red_combined < MIN_RED_COMBINED:
-            continue
-
-        is_target = (
-            b1 >= MIN_BLACK_DIAG_SCORE and
-            b2 >= MIN_BLACK_DIAG_SCORE and
-            black_combined >= MIN_BLACK_COMBINED
-        )
-
-        is_obstacle = (
-            r1 >= MIN_RED_DIAG_SCORE and
-            r2 >= MIN_RED_DIAG_SCORE and
-            red_combined >= MIN_RED_COMBINED
-        )
-
-        # Extra safety: weak partial response is ignored
-        if black_combined < MIN_BLACK_COMBINED:
-            is_target = False
-
-        if red_combined < MIN_RED_COMBINED:
-            is_obstacle = False
-
-        state = EMPTY
-        score = -1.0
-
-        target_score = black_combined + 0.25 * white_fill
-        obstacle_score = red_combined + 0.25 * white_fill
-
-        if is_target and not is_obstacle:
-            state = TARGET
-            score = target_score
-
-        elif is_obstacle and not is_target:
-            state = OBSTACLE
-            score = obstacle_score
-
-        elif is_target and is_obstacle:
-            # If both trigger, choose only if one is clearly stronger.
-            if target_score > obstacle_score + 0.10:
-                state = TARGET
-                score = target_score
-            elif obstacle_score > target_score + 0.10:
-                state = OBSTACLE
-                score = obstacle_score
-            else:
-                state = EMPTY
-                score = -1.0
-
-        if state != EMPTY and score > best_score:
-            best_score = score
-            best_state = state
-            best_rect = (x, y, w, h)
-            best_info = {
-                "reason": "valid_white_box_and_x",
-                "white_fill": white_fill,
-                "black_d1": b1,
-                "black_d2": b2,
-                "black_combined": black_combined,
-                "red_d1": r1,
-                "red_d2": r2,
-                "red_combined": red_combined,
-                "score": score,
-            }
-
-    return best_state, best_rect, best_info
-
-
-def color_for_state(state):
-    if state == TARGET:
-        return (0, 255, 0)
-    if state == OBSTACLE:
-        return (0, 0, 255)
-    return (180, 180, 180)
-
-
-def draw_text(img, text, x, y, color=(255, 255, 255), scale=0.5, thick=1):
-    cv2.putText(
-        img,
-        text,
-        (x, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        color,
-        thick,
-        cv2.LINE_AA
+    # Red X mask: red wraps around HSV hue
+    red_mask1 = cv2.inRange(
+        hsv,
+        np.array([0, RED_S_MIN, RED_V_MIN]),
+        np.array([10, 255, 255])
     )
 
+    red_mask2 = cv2.inRange(
+        hsv,
+        np.array([170, RED_S_MIN, RED_V_MIN]),
+        np.array([179, 255, 255])
+    )
 
-def process_heading_image(heading, img):
-    view = img.copy()
-    h, w = img.shape[:2]
-    slots = make_slot_boxes(w, h)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
 
-    states = []
-    infos = []
+    black_mask = clean_mask(black_mask, ksize=3, iterations=1)
+    red_mask = clean_mask(red_mask, ksize=3, iterations=1)
 
-    for i, (x0, y0, x1, y1) in enumerate(slots):
-        slot = img[y0:y1, x0:x1]
+    crop_area = crop.shape[0] * crop.shape[1]
 
-        state, rect, info = classify_marker_in_slot(slot)
-        states.append(state)
-        infos.append(info)
+    black_frac = cv2.countNonZero(black_mask) / crop_area
+    red_frac = cv2.countNonZero(red_mask) / crop_area
 
-        color = color_for_state(state)
+    # Classification rule
+    if red_frac >= MIN_RED_X_FRAC and red_frac > black_frac:
+        return "O", black_frac, red_frac, black_mask, red_mask
 
-        cv2.rectangle(view, (x0, y0), (x1, y1), (255, 255, 0), 2)
-        draw_text(view, f"slot {i}: {state}", x0 + 5, y0 + 20, color, 0.55, 2)
+    if black_frac >= MIN_BLACK_X_FRAC and black_frac >= red_frac:
+        return "T", black_frac, red_frac, black_mask, red_mask
 
-        if rect is not None and state != EMPTY:
-            rx, ry, rw, rh = rect
+    return "E", black_frac, red_frac, black_mask, red_mask
+
+
+def process_heading(heading):
+    img_path = os.path.join(SCAN_DIR, f"{heading}.jpg")
+
+    if not os.path.exists(img_path):
+        print(f"[WARN] Missing image: {img_path}")
+        return ["E", "E", "E"]
+
+    img = cv2.imread(img_path)
+
+    if img is None:
+        print(f"[WARN] Could not read image: {img_path}")
+        return ["E", "E", "E"]
+
+    debug = img.copy()
+    slots = get_front_slots(img)
+
+    result = []
+
+    for idx, (x1, y1, x2, y2) in enumerate(slots):
+        slot = img[y1:y2, x1:x2]
+
+        box = detect_white_box(slot)
+
+        if box is None:
+            label = "E"
+            black_frac = 0.0
+            red_frac = 0.0
+        else:
+            label, black_frac, red_frac, black_mask, red_mask = classify_x(slot, box)
+
+            bx, by, bw, bh, _ = box
             cv2.rectangle(
-                view,
-                (x0 + rx, y0 + ry),
-                (x0 + rx + rw, y0 + ry + rh),
-                color,
+                debug,
+                (x1 + bx, y1 + by),
+                (x1 + bx + bw, y1 + by + bh),
+                (255, 255, 255),
                 2
             )
 
-        b = info.get("black_combined", 0.0)
-        r = info.get("red_combined", 0.0)
-        wf = info.get("white_fill", 0.0)
+        result.append(label)
 
-        draw_text(view, f"B:{b:.2f} R:{r:.2f} W:{wf:.2f}", x0 + 5, y1 - 10, color)
+        # Draw slot
+        color = (0, 255, 0)
+        if label == "T":
+            color = (0, 0, 0)
+        elif label == "O":
+            color = (0, 0, 255)
 
-    row_chars = [state_to_char(s) for s in states]
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
 
-    draw_text(view, f"heading: {heading}", 10, 25, (255, 255, 255), 0.65, 2)
-    draw_text(view, f"row: {','.join(row_chars)}", 180, 25, (255, 255, 255), 0.65, 2)
+        cv2.putText(
+            debug,
+            f"{label} B:{black_frac:.3f} R:{red_frac:.3f}",
+            (x1 + 10, y1 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA
+        )
 
-    debug_path = os.path.join(DEBUG_DIR, f"{heading}_objects_debug.jpg")
-    cv2.imwrite(debug_path, view)
+    out_path = os.path.join(DEBUG_DIR, f"{heading}_object_debug.jpg")
+    cv2.imwrite(out_path, debug)
 
-    return states, infos, debug_path
-
-
-def apply_heading_to_grid(local_grid, heading, states):
-    positions = HEADING_TO_POSITIONS[heading]
-
-    for pos, state in zip(positions, states):
-        if pos == (0, 0):
-            continue
-
-        local_grid[pos] = state
+    return result
 
 
-def save_matrix_txt(local_grid):
-    mat = pretty_matrix(local_grid)
+def build_object_3x3(front, right, back, left):
+    """
+    Local 3x3 object grid.
 
-    out_path = os.path.join(RESULTS_DIR, "object_3x3.txt")
+    Center is agent A.
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        for row in mat:
-            f.write(",".join(row) + "\n")
+    This keeps the same scan logic:
+    front heading fills top row.
+    right heading fills right column.
+    back heading fills bottom row.
+    left heading fills left column.
+    """
 
-    return out_path
+    grid = [
+        ["E", "E", "E"],
+        ["E", "A", "E"],
+        ["E", "E", "E"]
+    ]
+
+    # front image: left, center, right
+    grid[0][0] = front[0]
+    grid[0][1] = front[1]
+    grid[0][2] = front[2]
+
+    # right image
+    grid[0][2] = strongest(grid[0][2], right[0])
+    grid[1][2] = right[1]
+    grid[2][2] = right[2]
+
+    # back image
+    grid[2][2] = strongest(grid[2][2], back[0])
+    grid[2][1] = back[1]
+    grid[2][0] = back[2]
+
+    # left image
+    grid[2][0] = strongest(grid[2][0], left[0])
+    grid[1][0] = left[1]
+    grid[0][0] = strongest(grid[0][0], left[2])
+
+    return grid
+
+
+def strongest(a, b):
+    """
+    Resolve duplicated corner observations.
+    Object wins over empty.
+    Obstacle wins over target if conflict, because obstacle is safety-critical.
+    """
+    if a == "O" or b == "O":
+        return "O"
+    if a == "T" or b == "T":
+        return "T"
+    return "E"
+
+
+def save_grid(grid):
+    txt_path = os.path.join(RESULTS_DIR, "object_3x3.txt")
+    json_path = os.path.join(RESULTS_DIR, "object_3x3.json")
+
+    with open(txt_path, "w") as f:
+        for row in grid:
+            f.write(" ".join(row) + "\n")
+
+    with open(json_path, "w") as f:
+        json.dump({"object_grid": grid}, f, indent=2)
+
+    print(f"[OK] Saved: {txt_path}")
+    print(f"[OK] Saved: {json_path}")
 
 
 def main():
-    print("=== Strict object detection from saved scan images ===")
-    print("Target   = white box + thick black X")
-    print("Obstacle = white box + thick red X")
-    print("Bias     = EMPTY if uncertain")
+    print("[INFO] Starting object detection...")
 
-    local_grid = blank_local_grid()
+    heading_results = {}
 
     for heading in HEADINGS:
-        path = IMAGE_PATHS[heading]
+        row = process_heading(heading)
+        heading_results[heading] = row
+        print(f"{heading}: {row}")
 
-        if not os.path.exists(path):
-            print(f"ERROR: Missing image for {heading}: {path}")
-            return
+    object_grid = build_object_3x3(
+        heading_results["front"],
+        heading_results["right"],
+        heading_results["back"],
+        heading_results["left"]
+    )
 
-        img = cv2.imread(path)
-        if img is None:
-            print(f"ERROR: Could not read image: {path}")
-            return
+    print("\nFinal object 3x3:")
+    for row in object_grid:
+        print(row)
 
-        states, infos, debug_path = process_heading_image(heading, img)
-        apply_heading_to_grid(local_grid, heading, states)
+    save_grid(object_grid)
 
-        print(f"\nHeading: {heading}")
-        print(f"image: {path}")
-        print(f"states: {[state_to_char(s) for s in states]}")
-        print(f"debug: {debug_path}")
-
-        for i, info in enumerate(infos):
-            print(
-                f"  slot {i}: "
-                f"W={info.get('white_fill', 0.0):.2f}, "
-                f"B={info.get('black_combined', 0.0):.2f}, "
-                f"R={info.get('red_combined', 0.0):.2f}, "
-                f"reason={info.get('reason', '')}"
-            )
-
-    print_matrix(local_grid)
-
-    out_path = save_matrix_txt(local_grid)
-
-    print(f"\nSaved object matrix to: {out_path}")
-    print(f"Saved debug images to: {DEBUG_DIR}")
+    print(f"[OK] Debug images saved in: {DEBUG_DIR}")
 
 
 if __name__ == "__main__":
